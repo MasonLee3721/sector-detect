@@ -12,8 +12,7 @@
 1. 價格 = COALESCE(price_adj.close_adj, price_daily.close)。
    若某族群完全無 price_adj，該族群結果標示 provisional（未還原）。
 2. flow_amt = (f_net + t_net + d_net) * close（股數 → 金額）。
-3. benchmark = 全市場等權日報酬。注意：market_daily 無加權指數收盤，
-   此為 proxy；正式版應接入加權指數日報酬（見 limitations）。
+3. benchmark = TAIEX 加權指數日報酬（market_daily.taiex_close，TWSE FMTQIK 回補）。
 4. compute_theme_frame → D1/D2/D3 ＋ S_early/S_mid/S_confirm（warmup 130 交易日）。
 5. H1a：波段內首次 flow_rising / leader_accelerating / converging 的日期差。
 6. H1b：S_early 叢集首日後 20 個交易日，族群等權報酬 − benchmark − 成本。
@@ -88,16 +87,15 @@ def load_matrices(con, stocks, start, end):
 
 
 def load_benchmark(con, start, end):
-    """全市場等權日報酬（proxy；正式版應為加權指數）。"""
-    px = qdf(con, """
-        SELECT p.date AS date, p.stock AS stock, COALESCE(a.close_adj, p.close) AS px
-        FROM price_daily p LEFT JOIN price_adj a ON a.date=p.date AND a.stock=p.stock
-        WHERE p.date BETWEEN ? AND ?""", (start, end))
-    if px.empty:
+    """TAIEX 加權指數日報酬（market_daily.taiex_close）。"""
+    df = qdf(con, """
+        SELECT date, taiex_close FROM market_daily
+        WHERE date BETWEEN ? AND ? AND taiex_close IS NOT NULL
+        ORDER BY date""", (start, end))
+    if df.empty:
         return None
-    piv = px.pivot(index='date', columns='stock', values='px').sort_index()
-    rets = piv.pct_change()
-    return rets.mean(axis=1, skipna=True)
+    df = df.set_index('date')['taiex_close']
+    return df.pct_change()
 
 
 def first_true(s):
@@ -312,7 +310,6 @@ def main():
                     'hit_rate': float(np.mean([x > 0 for x in allx]))})
     rep['h1b'] = h1b
     rep['limitations'].extend([
-        'benchmark 為全市場等權報酬 proxy，非加權指數；正式版應接入指數日報酬。',
         '波段起迄為 H1 規格建議起點，錨點應以資料驅動精煉（v0.2）。',
         '閾值為 PARAMS 固定值；threshold 優化與 walk-forward 為 v0.2。',
     ])
