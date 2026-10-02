@@ -80,7 +80,8 @@ def parse_events(stock, rows):
     evts = {}
     for r in rows:
         cash_d = fnum(r.get('CashEarningsDistribution')) + fnum(r.get('CashStatutorySurplus'))
-        stock_s = fnum(r.get('StockEarningsDistribution')) + fnum(r.get('StockStatutorySurplus'))
+        # 股票股利以面額（元/股）表示，除以 10（每股面額）才是股數/股
+        stock_s = (fnum(r.get('StockEarningsDistribution')) + fnum(r.get('StockStatutorySurplus'))) / 10.0
         for ex_date, amt, key in ((r.get('CashExDividendTradingDate'), cash_d, 'cash_d'),
                                   (r.get('StockExDividendTradingDate'), stock_s, 'stock_s')):
             if ex_date and amt > 0:
@@ -91,22 +92,52 @@ def parse_events(stock, rows):
 
 
 def validate(con, stock, ex_date, cash_d, stock_s):
-    """價格缺口驗證。回傳 (ok, info)。"""
+    """價格缺口驗證。回傳 (ok, info)。
+
+    若 ex_date 當天無行情（如颱風假休市），證交所會將除權息順延至次一交易日；
+    此處比照辦理：往後找最多 5 天內第一個有行情的交易日，並在 info 註記 shifted。
+    """
+    eff_date = ex_date
+    op = con.execute(
+        'SELECT open FROM price_daily WHERE stock=? AND date=?', (stock, eff_date)).fetchone()
+    shifts = 0
+    while (not op or op[0] is None) and shifts < 5:
+        nxt = con.execute(
+            'SELECT MIN(date) FROM price_daily WHERE stock=? AND date > ?',
+            (stock, eff_date)).fetchone()
+        if not nxt or not nxt[0]:
+            break
+        eff_date = nxt[0]
+        op = con.execute(
+            'SELECT open FROM price_daily WHERE stock=? AND date=?', (stock, eff_date)).fetchone()
+        shifts += 1
     prev = con.execute(
         'SELECT close FROM price_daily WHERE stock=? AND date < ? AND close IS NOT NULL'
-        ' ORDER BY date DESC LIMIT 1', (stock, ex_date)).fetchone()
-    op = con.execute(
-        'SELECT open FROM price_daily WHERE stock=? AND date=?', (stock, ex_date)).fetchone()
+        ' ORDER BY date DESC LIMIT 1', (stock, eff_date)).fetchone()
     if not prev or not op or op[0] is None:
         return False, {'reason': 'no_price_data'}
     prev_close, open_px = prev[0], op[0]
     ref = (prev_close - cash_d) / (1 + stock_s)
     if ref <= 0:
         return False, {'reason': 'bad_ref', 'prev_close': prev_close}
-    dev = abs(open_px - ref) / ref
-    info = {'prev_close': prev_close, 'ref': ref, 'open': open_px, 'dev': dev,
+    hl = con.execute(
+        'SELECT high, low, close FROM price_daily WHERE stock=? AND date=?',
+        (stock, eff_date)).fetchone()
+    high_px, low_px, close_px = hl
+    dev_open = abs(open_px - ref) / ref
+    dev_close = abs(close_px - ref) / ref if close_px else 999
+    in_range = (low_px is not None and high_px is not None and low_px <= ref <= high_px)
+    info = {'prev_close': prev_close, 'ref': ref, 'open': open_px, 'dev': dev_open,
             'cash_d': cash_d, 'stock_s': stock_s}
-    return dev <= TOL, info
+    # 三條件任一成立即接受：開盤接近、理論價被當日交易穿越、收盤接近
+    ok = dev_open <= TOL or in_range or dev_close <= TOL
+    if not ok:
+        info['dev_close'] = dev_close
+        info['in_range'] = in_range
+    if eff_date != ex_date:
+        info['shifted'] = f'{ex_date}->{eff_date}'
+        ex_date = eff_date
+    return ok, info, ex_date
 
 
 def market_of(con, stock):
@@ -125,8 +156,8 @@ def run(stocks, con):
         evts = parse_events(stock, rows)
         for ex_date in sorted(evts):
             e = evts[ex_date]
-            ok, info = validate(con, stock, ex_date, e['cash_d'], e['stock_s'])
-            rec = (stock, ex_date, e['cash_d'], e['stock_s'], info)
+            ok, info, eff_date = validate(con, stock, ex_date, e['cash_d'], e['stock_s'])
+            rec = (stock, eff_date, e['cash_d'], e['stock_s'], info)
             if info.get('reason') == 'no_price_data':
                 pending.append(rec)
             elif ok:
