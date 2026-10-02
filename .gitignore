@@ -1,0 +1,22 @@
+# Python / data
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Data (never commit raw or paid data)
+/data/
+/output/
+*.db
+*.duckdb
+*.parquet
+
+# Secrets
+.env
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
