@@ -85,7 +85,13 @@ def twse_margin(yyyymmdd):
 
 
 def twse_exdiv(yyyymmdd):
-    """TWT49U 除權息結果 → [(code, prev_close, ref_price, factor, kind)]"""
+    """TWT49U 除權息結果 → [(ex_date, code, prev_close, ref_price, factor, kind)]
+
+    注意：此端點為「未來預告式」，r[0] 的除權息日通常晚於查詢日。
+    必須使用 row 內的實際除權息日作為 ex_date（民國「115年10月05日」→ 西元），
+    不可用查詢日，否則歷史回補會寫入錯誤的 ex_date。
+    """
+    import re
     d = fetch(f'https://www.twse.com.tw/rwd/zh/exRight/TWT49U?response=json&date={yyyymmdd}')
     _sleep()
     if not (d and d.get('data')):
@@ -95,9 +101,14 @@ def twse_exdiv(yyyymmdd):
         code = r[1].strip()
         if not CODE_RE.match(code):
             continue
+        m = re.match(r'(\d+)年(\d+)月(\d+)日', r[0].strip())
+        if not m:
+            continue
+        # YYYYMMDD（與 price_daily.date 一致，字串比較才正確）
+        ex_date = f'{int(m.group(1)) + 1911:04d}{int(m.group(2)):02d}{int(m.group(3)):02d}'
         prev, ref = num(r[3]), num(r[4])
         if prev and ref and prev > 0 and ref > 0 and ref != prev:
-            out.append((code, prev, ref, ref / prev, r[6].strip()))
+            out.append((ex_date, code, prev, ref, ref / prev, r[6].strip()))
     return out
 
 
