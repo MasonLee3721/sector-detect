@@ -31,11 +31,15 @@ def merge():
         for tbl in TABLES:
             n = main.execute(f'INSERT OR REPLACE INTO {tbl} SELECT * FROM w.{tbl}').rowcount
             print(f'{pdb.split("/")[-1]}:{tbl} +{n}', flush=True)
-        main.execute('''INSERT INTO universe(stock,market,name,first_date,last_date,is_common)
-                        SELECT stock,market,name,first_date,last_date,is_common FROM w.universe
-                        ON CONFLICT(stock) DO UPDATE SET
-                          first_date = min(universe.first_date, excluded.first_date),
-                          last_date = max(universe.last_date, excluded.last_date)''')
+        # 注意：SELECT FROM w.<attached> 時 ON CONFLICT 會觸發 SQLite 解析 bug，改用 INSERT OR IGNORE
+        main.execute('''INSERT OR IGNORE INTO universe(stock,market,name,first_date,last_date,is_common)
+                        SELECT stock,market,name,first_date,last_date,is_common FROM w.universe''')
+        rows = main.execute(
+            'SELECT stock,market,name,first_date,last_date,is_common FROM w.universe').fetchall()
+        for (stock, market, name, fd, ld, ic) in rows:
+            main.execute('''UPDATE universe SET first_date = min(first_date, ?),
+                            last_date = max(last_date, ?) WHERE stock = ?''', (fd, ld, stock))
+        main.commit()  # INSERT/UPDATE 未 commit 前 DETACH 會報 database is locked
         main.execute('DETACH DATABASE w')
     main.commit()
     print('merged. recomputing adjustment...', flush=True)
