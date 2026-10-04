@@ -21,8 +21,13 @@ import numpy as np
 from sd_data.backfill import backfill
 from sd_data.calibrate import load_matrices, load_benchmark
 from sd_data.indicators import compute_theme_frame
+from sd_data.ignition import sss_series, ignition_v2_signals, IG_V2_DEFAULTS
 
 DB_DEFAULT = '/home/hatch/workspace/sector-detect/sector_detect.db'
+IGNITION_STATE = '/home/hatch/workspace/sector-detect/ignition_state.json'
+# 點火規則 v1（2026-10-04 校準）：IGNITE = was_cold(t-5排名後半) & 3日超額>2% & 廣度>0.6
+# 26 個冷啟動波段召回率 85%，中位領先波段起點 2.5 天；屬召回型 watchlist，非買入訊號。
+THRUST_X = 0.02
 
 
 def update_to_latest(db_path):
@@ -43,7 +48,11 @@ def update_to_latest(db_path):
 
 
 def compute_daily_sss(con):
-    """計算 38 族群最新一日的 SSS。回傳 list of dict（按 5 日平均 SSS 排序）。"""
+    """計算 38 族群最新一日的 SSS。回傳 (rows, latest, ignitions)。
+
+    rows: list of dict（按 5 日平均 SSS 排序，含 rank/level）。
+    ignitions: 當日點火候選（冷啟動）list，已經 20 日去重。
+    """
     sectors = [(r[0], r[1]) for r in con.execute(
         "SELECT DISTINCT sector_id, sector_name FROM sector_map ORDER BY sector_id")]
     mkt = pd.read_sql_query(
@@ -51,8 +60,10 @@ def compute_daily_sss(con):
     mkt = mkt.set_index('date')['taiex_close'].sort_index()
     all_dates = sorted(mkt.index)
     latest = all_dates[-1]
+    mkt_ret = mkt.pct_change()
 
     rows = []
+    sss5, frames = {}, {}
     for sid, sname in sectors:
         stocks = [r[0] for r in con.execute(
             "SELECT stock FROM sector_map WHERE sector_id=?", (sid,))]
@@ -62,6 +73,8 @@ def compute_daily_sss(con):
             continue
         bench = bench.reindex(m['dates']).fillna(0)
         f = compute_theme_frame(m['prices'], m['flow_amt'], m['amounts'], bench)
+        frames[sid] = f
+        sss5[sid] = sss_series(f)['sss'].rolling(5).mean()
         for col, zc in (('hhi', 'z_hhi'), ('inflow_tot_5d', 'z_tot5')):
             r = f[col].rolling(120, min_periods=60)
             f[zc] = ((f[col] - r.mean()) / r.std()).fillna(0)
@@ -85,7 +98,54 @@ def compute_daily_sss(con):
         r['rank'] = i
         s = r['sss_5d']
         r['level'] = '強' if s > 3 else ('中' if s > 1 else ('弱' if s < -1 else '平'))
-    return rows, latest
+
+    # ---- 點火（冷啟動）偵測 ----
+    rankw = pd.DataFrame(sss5).rank(axis=1, ascending=False, method='min')
+    name_of = {r['sector_id']: r['sector_name'] for r in rows}
+    ignitions = compute_ignitions(frames, rankw, mkt_ret, latest, all_dates, name_of)
+    return rows, latest, ignitions
+
+
+def compute_ignitions(frames, rankw, mkt_ret, latest, all_dates, name_of):
+    """當日點火候選。經 ignition_state.json 做 20 交易日去重。"""
+    import json as _json
+    import os
+    state = {}
+    if os.path.exists(IGNITION_STATE):
+        try:
+            state = _json.load(open(IGNITION_STATE))
+        except Exception:
+            state = {}
+    out = []
+    for sid, f in frames.items():
+        try:
+            if sid not in rankw.columns or latest not in rankw[sid].index:
+                continue
+            sig = ignition_v2_signals(f, rankw[sid], mkt_ret, thrust_x=THRUST_X,
+                                      cold_rank_cut=IG_V2_DEFAULTS['cold_rank_cut'])
+            if not bool(sig['ignite_raw'].iloc[-1]):
+                continue
+            # 去重：20 交易日內點過就跳過
+            last = state.get(sid)
+            if last and last in all_dates:
+                if all_dates.index(latest) - all_dates.index(last) < IG_V2_DEFAULTS['cooldown']:
+                    continue
+            out.append({
+                'sector_id': sid,
+                'sector_name': name_of.get(sid, sid),
+                'rank_5d': int(rankw[sid].loc[latest]),
+                'thrust_3d': round(float(sig['thrust_3d'].iloc[-1]), 4),
+                'breadth': round(float(f['breadth'].iloc[-1]), 2),
+                'money_confirmed': bool(sig['money_confirmed'].iloc[-1]),
+                'leader_led': bool(sig['leader_led'].iloc[-1]),
+            })
+            state[sid] = latest
+        except Exception:
+            continue
+    # 只有實際輸出點火才寫回 state（避免空跑覆蓋）
+    if out:
+        _json.dump(state, open(IGNITION_STATE, 'w'), ensure_ascii=False, indent=1)
+    return out
 
 
 def main():
@@ -100,11 +160,14 @@ def main():
         print(f'data updated: {n} new day(s)', flush=True)
 
     con = sqlite3.connect(ns.db)
-    rows, latest = compute_daily_sss(con)
+    rows, latest, ignitions = compute_daily_sss(con)
 
     outdir = Path(ns.out) / latest
     outdir.mkdir(parents=True, exist_ok=True)
-    json.dump({'date': latest, 'sectors': rows},
+    json.dump({'date': latest, 'sectors': rows, 'ignitions': ignitions,
+               'ignition_params': {'thrust_x': THRUST_X,
+                                   'cold_rank_cut': IG_V2_DEFAULTS['cold_rank_cut'],
+                                   'cooldown': IG_V2_DEFAULTS['cooldown']}},
               open(outdir / 'sss.json', 'w'), ensure_ascii=False, indent=1)
 
     # 文字摘要
@@ -114,6 +177,21 @@ def main():
         lines.append(f"{r['rank']:<4d} {r['sector_name']:22s} {r['sss_5d']:+7.2f} "
                      f"{r['sss_today']:+7.2f} {r['level']:<4s} "
                      f"{r['z_d1']:+.1f}/{r['z_d2']:+.1f}/{r['z_d3']:+.1f}")
+
+    # 點火候選（冷啟動）：排名後半＋3日超額>2%＋廣度>0.6，20日去重
+    lines += ['', '─' * 60, '點火候選（冷啟動，召回型 watchlist，非買入訊號）', '']
+    if ignitions:
+        for g in ignitions:
+            tags = []
+            if g['money_confirmed']:
+                tags.append('資金確認')
+            if g['leader_led']:
+                tags.append('領頭加速')
+            tag = '＋'.join(tags) if tags else '無加權'
+            lines.append(f"  [點火] {g['sector_name'][:20]:20s} 排名#{g['rank_5d']} "
+                         f"3日超額 {g['thrust_3d']:+.2%} 廣度 {g['breadth']:.2f} [{tag}]")
+    else:
+        lines.append('  （今日無點火）')
 
     # 昨日排名 vs 今日實際對帳
     lines += ['', '─' * 60, '昨日排名 vs 今日實際（紙上驗證）', '']
