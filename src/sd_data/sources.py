@@ -112,8 +112,21 @@ def twse_exdiv(yyyymmdd):
     return out
 
 
+def twse_index_close(yyyymmdd):
+    """FMTQIK 加權指數日收盤 → float；抓不到回傳 None"""
+    d = fetch(f'https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={yyyymmdd}')
+    _sleep()
+    if not (d and d.get('stat') == 'OK' and d.get('data')):
+        return None
+    roc = f'{int(yyyymmdd[:4]) - 1911}/{yyyymmdd[4:6]}/{yyyymmdd[6:8]}'
+    for r in d['data']:
+        if (r[0] or '').strip() == roc:
+            return num(r[4])
+    return None
+
+
 def twse_market(yyyymmdd):
-    """BFI82U 市場法人合計＋MI_INDEX 大盤統計 → dict（億元、家數）"""
+    """BFI82U 市場法人合計＋MI_INDEX 大盤統計＋FMTQIK 加權指數收盤 → dict（億元、家數）"""
     d = fetch(f'https://www.twse.com.tw/fund/BFI82U?response=json&dayDate={yyyymmdd}&type=day')
     _sleep()
     f_m = t_m = dd_m = 0.0
@@ -146,7 +159,8 @@ def twse_market(yyyymmdd):
                     elif r[0].startswith('下跌'):
                         down = int(m.group(1))
     return {'f_net': f_m, 't_net': t_m, 'd_net': dd_m,
-            'total_turnover': tot, 'up_count': up, 'down_count': down}
+            'total_turnover': tot, 'up_count': up, 'down_count': down,
+            'taiex_close': twse_index_close(yyyymmdd)}
 
 
 # ---------- TPEx（上櫃） ----------
