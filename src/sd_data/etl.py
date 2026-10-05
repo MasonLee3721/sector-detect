@@ -74,14 +74,17 @@ def etl_day(con, yyyymmdd):
                     (yyyymmdd, code, prev, today))
         n_marg += 1
 
-    for code, prev, ref, factor, kind in tw_x:
+    for ex_date, code, prev, ref, factor, kind in tw_x:
         cur.execute('INSERT OR REPLACE INTO exdiv VALUES (?,?,?,?,?,?,?)',
-                    (yyyymmdd, code, 'TWSE', prev, ref, factor, kind))
+                    (ex_date, code, 'TWSE', prev, ref, factor, kind))
         n_xdiv += 1
 
-    cur.execute('INSERT OR REPLACE INTO market_daily VALUES (?,?,?,?,?,?,?)',
+    cur.execute('''INSERT OR REPLACE INTO market_daily
+                   (date, f_net, t_net, d_net, total_turnover, up_count, down_count, taiex_close)
+                   VALUES (?,?,?,?,?,?,?,?)''',
                 (yyyymmdd, tw_mkt['f_net'], tw_mkt['t_net'], tw_mkt['d_net'],
-                 tw_mkt['total_turnover'], tw_mkt['up_count'], tw_mkt['down_count']))
+                 tw_mkt['total_turnover'], tw_mkt['up_count'], tw_mkt['down_count'],
+                 tw_mkt.get('taiex_close')))
 
     con.commit()
     print(f'  price={n_price} flow={n_flow} margin={n_marg} exdiv={n_xdiv} '
