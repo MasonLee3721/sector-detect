@@ -125,9 +125,9 @@ def compute_ignitions(frames, rankw, mkt_ret, latest, all_dates, name_of):
                                       cold_rank_cut=IG_V2_DEFAULTS['cold_rank_cut'])
             if not bool(sig['ignite_raw'].iloc[-1]):
                 continue
-            # 去重：20 交易日內點過就跳過
+            # 去重：20 交易日內點過就跳過；但同一天重跑要保留（冪等）
             last = state.get(sid)
-            if last and last in all_dates:
+            if last and last in all_dates and last != latest:
                 if all_dates.index(latest) - all_dates.index(last) < IG_V2_DEFAULTS['cooldown']:
                     continue
             out.append({
@@ -195,21 +195,30 @@ def main():
 
     # 昨日排名 vs 今日實際對帳
     lines += ['', '─' * 60, '昨日排名 vs 今日實際（紙上驗證）', '']
+    recon_data = None
     try:
-        recon = reconcile_yesterday(con, ns.out, latest, rows)
-        lines += recon
+        recon_lines, recon_data = reconcile_yesterday(con, ns.out, latest, rows)
+        lines += recon_lines
     except Exception as e:
         lines.append(f'對帳跳過：{e}')
     con.close()
 
     summary = '\n'.join(lines)
     (outdir / 'sss.txt').write_text(summary, encoding='utf-8')
+    # 把對帳結構化資料補進 sss.json（供 HTML 報表用）
+    if recon_data:
+        sss_path = outdir / 'sss.json'
+        jd = json.load(open(sss_path, encoding='utf-8'))
+        jd['reconciliation'] = recon_data
+        json.dump(jd, open(sss_path, 'w'), ensure_ascii=False, indent=1)
     print(summary)
     print(f'\nwritten to {outdir}')
 
 
 def reconcile_yesterday(con, out_dir, latest, rows):
-    """讀昨日 sss.json 的排名，對比今日各族群實際報酬。"""
+    """讀昨日 sss.json 的排名，對比今日各族群實際報酬。
+
+    回傳 (文字行 list, 結構化 dict)。"""
     import json as _json
     out_dir = Path(out_dir)
     # 找最近一個有 sss.json 的歷史日期
@@ -219,7 +228,7 @@ def reconcile_yesterday(con, out_dir, latest, rows):
             prev = d.name
             break
     if not prev:
-        return ['（無昨日排名資料，跳過對帳）']
+        return ['（無昨日排名資料，跳過對帳）'], None
     ydata = _json.load(open(out_dir / prev / 'sss.json'))
     yrank = {s['sector_name']: (s['rank'], s['sss_5d']) for s in ydata['sectors']}
 
@@ -240,6 +249,7 @@ def reconcile_yesterday(con, out_dir, latest, rows):
     ordered = sorted(rows, key=lambda r: yrank.get(r['sector_name'], (99, 0))[0])
     picks = ordered[:8] + ordered[-3:]
     hits = 0
+    items = []
     for r in picks:
         yr, ys = yrank.get(r['sector_name'], (None, None))
         if yr is None:
@@ -253,9 +263,14 @@ def reconcile_yesterday(con, out_dir, latest, rows):
             hits += 1
         tag = '前段' if yr <= 8 else '後段'
         lines.append(f'  [{tag}#{yr}] {r["sector_name"][:18]:18s} 昨日SSS {ys:+.2f} → 今日 {sr:+.2%} (超額 {ex:+.2%}) {mark}')
+        items.append({'sector_name': r['sector_name'], 'tag': tag, 'y_rank': yr,
+                      'y_sss': round(ys, 2), 'ret': round(sr, 4),
+                      'excess': round(ex, 4), 'mark': mark})
     lines.append('')
     lines.append(f'命中：{hits}/{len(picks)}')
-    return lines
+    data = {'prev_date': prev, 'date': latest, 'mkt_ret': round(mkt_ret, 4),
+            'hits': hits, 'total': len(items), 'items': items}
+    return lines, data
 
 
 if __name__ == '__main__':
