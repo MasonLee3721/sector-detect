@@ -6,9 +6,11 @@
 """
 import json
 import sys
+import sqlite3
 from pathlib import Path
 
 REPORTS = Path('/home/hatch/workspace/sector-detect/reports')
+DB = '/home/hatch/workspace/sector-detect/sector_detect.db'
 
 CSS = """body{font-family:-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif;max-width:980px;margin:0 auto;padding:20px 16px 48px;background:#fafafa;color:#222;line-height:1.6}
 h1{font-size:1.35rem;margin:0 0 4px}
@@ -22,6 +24,11 @@ th{background:#f2f2f2;font-weight:700;text-align:center}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
 td.pos{color:#c0392b;font-weight:600}
 td.neg{color:#1e8449;font-weight:600}
+a.tk{color:#1a56db;text-decoration:none;border-bottom:1px dotted #1a56db}
+a.tk:hover{color:#c0392b;border-bottom-style:solid}
+a.tk::after{content:" ↗";font-size:.72em;color:#888}
+.leader{font-size:.78rem;line-height:1.7;white-space:nowrap}
+.leader .ex{font-variant-numeric:tabular-nums}
 .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.75rem;font-weight:700}
 .b-strong{background:#c0392b;color:#fff}
 .b-mid{background:#f39c12;color:#fff}
@@ -44,6 +51,70 @@ def fmt(v, pct=False):
     return f'<td class="num {cls(v)}">{s}</td>'
 
 
+def load_leaders(date, sectors):
+    """對 5 日 SSS > 0 的族群，取近 5 日超額報酬前 3 名為代表股。
+
+    回傳 {sector_id: [(代號, 名稱, 超額報酬), ...]}。"""
+    import pandas as pd
+    pos = [s for s in sectors if s['sss_5d'] > 0]
+    if not pos:
+        return {}
+    con = sqlite3.connect(DB)
+    try:
+        # 往前取 8 個交易日，確保能抓到 5 日前價格
+        dates = [r[0] for r in con.execute(
+            "SELECT date FROM market_daily WHERE date <= ? AND taiex_close IS NOT NULL "
+            "ORDER BY date DESC LIMIT 8", (date,))]
+        if len(dates) < 6:
+            return {}
+        d0, d1 = dates[0], dates[5]
+        mkt = con.execute(
+            "SELECT taiex_close FROM market_daily WHERE date IN (?, ?)", (d0, d1)).fetchall()
+        if len(mkt) < 2 or not all(m[0] for m in mkt):
+            return {}
+        mkt_ret = mkt[0][0] / mkt[1][0] - 1
+        names = {r[0]: r[1] for r in con.execute("SELECT stock, name FROM universe")}
+        out = {}
+        for s in pos:
+            sid = s['sector_id']
+            stocks = [r[0] for r in con.execute(
+                "SELECT stock FROM sector_map WHERE sector_id=?", (sid,))]
+            if not stocks:
+                continue
+            q = ("SELECT p.stock AS stock, p.date AS date, p.close AS close, a.close_adj AS close_adj "
+                 "FROM price_daily p "
+                 "LEFT JOIN price_adj a ON a.date=p.date AND a.stock=p.stock "
+                 "WHERE p.date IN (?, ?) AND p.stock IN (%s)" % ','.join('?' * len(stocks)))
+            df = pd.read_sql_query(q, con, params=(d0, d1, *stocks))
+            df['px'] = df['close_adj'].fillna(df['close'])
+            rets = []
+            for stk in stocks:
+                sub = df[df['stock'] == stk].set_index('date')['px']
+                if d0 in sub.index and d1 in sub.index:
+                    p0, p1 = sub.loc[d0], sub.loc[d1]
+                    if p0 and p1 and p1 > 0:
+                        rets.append((stk, p0 / p1 - 1 - mkt_ret))
+            rets.sort(key=lambda x: -x[1])
+            out[sid] = [(stk, names.get(stk, ''), ex) for stk, ex in rets[:3]]
+        return out
+    finally:
+        con.close()
+
+
+def leader_cell(leaders):
+    """代表股儲存格：代號名稱＋超額報酬，附玩股網技術線圖連結。"""
+    if not leaders:
+        return '<td class="note">—</td>'
+    parts = []
+    for stk, name, ex in leaders:
+        c = cls(ex)
+        parts.append(
+            f'<a class="tk" href="https://www.wantgoo.com/stock/{stk}/technical-chart" '
+            f'target="_blank" rel="noopener">{stk}{name}</a>'
+            f' <span class="ex {c}">{ex:+.1%}</span>')
+    return '<td><div class="leader">' + '<br>'.join(parts) + '</div></td>'
+
+
 def build(date_dir: Path) -> Path:
     d = json.load(open(date_dir / 'sss.json', encoding='utf-8'))
     date = d['date']
@@ -61,7 +132,8 @@ def build(date_dir: Path) -> Path:
             f'「強」級別共 {n_strong} 個；'
             f'點火候選 {len(ignitions)} 個。')
 
-    # SSS 排名表
+    # SSS 排名表（5 日 SSS > 0 的族群加掛代表股：近 5 日超額報酬前 3 名）
+    leaders = load_leaders(date, sectors)
     rows = []
     for s in sectors:
         badge = LEVEL_BADGE.get(s['level'], 'b-flat')
@@ -69,11 +141,15 @@ def build(date_dir: Path) -> Path:
             f'<tr><td class="num">{s["rank"]}</td><td>{s["sector_name"]}</td>'
             f'{fmt(s["sss_5d"])}{fmt(s["sss_today"])}'
             f'<td><span class="badge {badge}">{s["level"]}</span></td>'
-            f'{fmt(s["z_d1"])}{fmt(s["z_d2"])}{fmt(s["z_d3"])}</tr>')
+            f'{fmt(s["z_d1"])}{fmt(s["z_d2"])}{fmt(s["z_d3"])}'
+            f'{leader_cell(leaders.get(s["sector_id"]))}</tr>')
     rank_tbl = ('<div class="tbl"><table><thead><tr><th>#</th><th>族群</th>'
                 '<th>5日SSS</th><th>今日SSS</th><th>強度</th>'
-                '<th>D1 同動</th><th>D2 資金</th><th>D3 領頭</th></tr></thead><tbody>'
-                + ''.join(rows) + '</tbody></table></div>')
+                '<th>D1 同動</th><th>D2 資金</th><th>D3 領頭</th>'
+                '<th>代表股（5日領漲前3，附技術線圖）</th></tr></thead><tbody>'
+                + ''.join(rows) + '</tbody></table></div>'
+                '<p class="note">代表股：該族群近 5 日相對大盤超額報酬前 3 名，僅 5 日 SSS &gt; 0 的族群列出；'
+                '點代號開啟玩股網技術線圖。</p>')
 
     # 點火區
     if ignitions:
