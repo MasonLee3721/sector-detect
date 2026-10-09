@@ -52,11 +52,11 @@ def fmt(v, pct=False):
 
 
 def load_leaders(date, sectors):
-    """對 5 日 SSS > 0 的族群，取近 5 日超額報酬前 3 名為代表股。
+    """全族群取近 5 日超額報酬前 3 名為代表股。
 
     回傳 {sector_id: [(代號, 名稱, 超額報酬), ...]}。"""
     import pandas as pd
-    pos = [s for s in sectors if s['sss_5d'] > 0]
+    pos = sectors
     if not pos:
         return {}
     con = sqlite3.connect(DB)
@@ -68,11 +68,11 @@ def load_leaders(date, sectors):
         if len(dates) < 6:
             return {}
         d0, d1 = dates[0], dates[5]
-        mkt = con.execute(
-            "SELECT taiex_close FROM market_daily WHERE date IN (?, ?)", (d0, d1)).fetchall()
-        if len(mkt) < 2 or not all(m[0] for m in mkt):
+        mkt = {r[0]: r[1] for r in con.execute(
+            "SELECT date, taiex_close FROM market_daily WHERE date IN (?, ?)", (d0, d1))}
+        if d0 not in mkt or d1 not in mkt or not mkt[d0] or not mkt[d1]:
             return {}
-        mkt_ret = mkt[0][0] / mkt[1][0] - 1
+        mkt_ret = mkt[d0] / mkt[d1] - 1
         names = {r[0]: r[1] for r in con.execute("SELECT stock, name FROM universe")}
         out = {}
         for s in pos:
@@ -132,7 +132,7 @@ def build(date_dir: Path) -> Path:
             f'「強」級別共 {n_strong} 個；'
             f'點火候選 {len(ignitions)} 個。')
 
-    # SSS 排名表（5 日 SSS > 0 的族群加掛代表股：近 5 日超額報酬前 3 名）
+    # SSS 排名表（全族群加掛代表股：近 5 日超額報酬前 3 名）
     leaders = load_leaders(date, sectors)
     rows = []
     for s in sectors:
@@ -148,7 +148,7 @@ def build(date_dir: Path) -> Path:
                 '<th>D1 同動</th><th>D2 資金</th><th>D3 領頭</th>'
                 '<th>代表股（5日領漲前3，附技術線圖）</th></tr></thead><tbody>'
                 + ''.join(rows) + '</tbody></table></div>'
-                '<p class="note">代表股：該族群近 5 日相對大盤超額報酬前 3 名，僅 5 日 SSS &gt; 0 的族群列出；'
+                '<p class="note">代表股：該族群近 5 日相對大盤超額報酬前 3 名；'
                 '點代號開啟玩股網技術線圖。</p>')
 
     # 點火區
